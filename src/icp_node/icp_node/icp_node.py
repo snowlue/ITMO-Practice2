@@ -2,6 +2,10 @@ import math
 import numpy as np
 
 import rclpy
+import tf2_ros
+from geometry_msgs.msg import TransformStamped
+from sensor_msgs.msg import PointCloud2, PointField
+import sensor_msgs_py.point_cloud2 as pc2
 from sensor_msgs.msg import LaserScan
 from rclpy.node import Node
 
@@ -9,12 +13,34 @@ from rclpy.node import Node
 class ICPNode(Node):
     def __init__(self):
         super().__init__('icp_node')
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+
         self.subscription = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.pc_pub = self.create_publisher(PointCloud2, '/icp/cloud', 10)
+
         self.prev_pcd = None
-        self.max_correspondence_distance = 0.5  # максимальное расстояние для соответствий
-        self.icp_iteration = 50
         self.get_logger().info('ICP node initialized, waiting for /scan…')
 
+    def publish_transform(self, t, R, stamp):
+        tr = TransformStamped()
+        tr.header.stamp = stamp
+        tr.header.frame_id = 'icp_prev'
+        tr.child_frame_id = 'icp_curr'
+        tr.transform.translation.x = float(t[0])
+        tr.transform.translation.y = float(t[1])
+        tr.transform.translation.z = 0.0
+        yaw = math.atan2(R[1, 0], R[0, 0])
+        tr.transform.rotation.z = math.sin(yaw / 2)
+        tr.transform.rotation.w = math.cos(yaw / 2)
+        self.tf_broadcaster.sendTransform(tr)
+
+    def publish_cloud(self, pts, header):
+        header.frame_id = 'icp_curr'
+        fields = [PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                  PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                  PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1)]
+        cloud_msg = pc2.create_cloud(header, fields, [(float(x), float(y), 0.0) for x, y in pts])
+        self.pc_pub.publish(cloud_msg) 
 
     def icp(self, S_move, S_fix, max_iterations=20, tolerance=1e-6):
         """
@@ -83,12 +109,14 @@ class ICPNode(Node):
             return
 
         T, R = self.icp(pcd, self.prev_pcd)
-        self.get_logger().info("T:" + str(T) + "R:" + str(R))
 
-        dx, dy = T
-        yaw = math.atan2(R[1, 0], R[0, 1])  # угол поворота в плоскости XY
+        header = scan.header
+        self.publish_transform(T, R, header.stamp)
+        self.publish_cloud(pcd, header)
+        # dx, dy = T
+        # yaw = math.atan2(R[1, 0], R[0, 0])  # угол поворота в плоскости XY
 
-        self.get_logger().info(f'ICP: Δx={dx:.3f} m, Δy={dy:.3f} m, Δyaw={math.degrees(yaw):.2f}°')
+        # self.get_logger().info(f'ICP: Δx={dx:.3f} m, Δy={dy:.3f} m, Δyaw={math.degrees(yaw):.2f}°')
 
         # Обновляем эталон
         self.prev_pcd = pcd
