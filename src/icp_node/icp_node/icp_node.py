@@ -1,18 +1,20 @@
+import math
 import numpy as np
 
 import rclpy
-from geometry_msgs.msg import Quaternion, TransformStamped, Twist
-from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from rclpy.node import Node
-from transforms3d.euler import euler2quat
 
 
 class ICPNode(Node):
     def __init__(self):
         super().__init__('icp_node')
-        # self.publisher = self.create_publisher(Odometry, '/odom', 10)
         self.subscription = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.prev_pcd = None
+        self.max_correspondence_distance = 0.5  # максимальное расстояние для соответствий
+        self.icp_iteration = 50
+        self.get_logger().info('ICP node initialized, waiting for /scan…')
+
 
     def icp(self, S_move, S_fix, max_iterations=20, tolerance=1e-6):
         """
@@ -21,6 +23,7 @@ class ICPNode(Node):
         """
         src = np.copy(S_move)  # исходная (двигаемая) облако точек
         dst = np.copy(S_fix)  # целевое (фиксированное)
+        # t = np.eye(4)
 
         for _ in range(max_iterations):
             # 1. Поиск ближайших соседей
@@ -60,40 +63,36 @@ class ICPNode(Node):
 
             src = src_transformed
 
-        return src, R, t
+        return t, R
 
-    def publish_info(self, x, y, th):
-        msg = Odometry()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'odom'
-        msg.child_frame_id = 'base_link'
-        msg.pose.pose.position.x = x
-        msg.pose.pose.position.y = y
-        # q = tf_transformations.quaternion_from_euler(0, 0, th)
-        w, x, y, z = euler2quat(0, 0, th)
-        q = [x, y, z, w]
-        msg.pose.pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
-        self.publisher.publish(msg)
+    def scan_callback(self, scan: LaserScan):
+        # self.get_logger().info("scan:" + str(scan))
 
-        transform = TransformStamped()
+        angles = np.linspace(scan.angle_min, scan.angle_max, len(scan.ranges))
+        ranges = np.array(scan.ranges)
+        mask = np.isfinite(ranges)
+        angles = angles[mask]
+        ranges = ranges[mask]
+        xs = ranges * np.cos(angles)
+        ys = ranges * np.sin(angles)
+        pcd = np.vstack((xs, ys)).T
 
-        transform.header.stamp = self.get_clock().now().to_msg()
-        transform.header.frame_id = 'odom'
-        transform.child_frame_id = 'base_link'
+        if self.prev_pcd is None:
+            self.prev_pcd = pcd
+            self.get_logger().info('Saved reference scan.')
+            return
 
-        transform.transform.translation.x = x
-        transform.transform.translation.y = y
-        transform.transform.translation.z = 0.0
+        T, R = self.icp(pcd, self.prev_pcd)
+        self.get_logger().info("T:" + str(T) + "R:" + str(R))
 
-        transform.transform.rotation.x = q[0]
-        transform.transform.rotation.y = q[1]
-        transform.transform.rotation.z = q[2]
-        transform.transform.rotation.w = q[3]
+        dx, dy = T
+        yaw = math.atan2(R[1, 0], R[0, 1])  # угол поворота в плоскости XY
 
+        self.get_logger().info(f'ICP: Δx={dx:.3f} m, Δy={dy:.3f} m, Δyaw={math.degrees(yaw):.2f}°')
 
-    def scan_callback(self, msg: Twist):
-        ...
-        
+        # Обновляем эталон
+        self.prev_pcd = pcd
+
 
 def main(args=None):
     # try:

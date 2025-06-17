@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'icp_node = icp_node.icp_node:main',
         ],
     },
 )
