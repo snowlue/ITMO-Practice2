@@ -38,10 +38,14 @@ class ICPNode(Node):
             cloud_msg = pc2.create_cloud(header, fields, points_list)
             self.map_pub.publish(cloud_msg)
 
-    def icp(self, S_move, S_fix, max_iterations=20, tolerance=1e-6):
+    def icp(self, S_move, S_fix, max_iterations=20, tolerance=1e-6, max_distance=1.0):
         """
         S_move: np.ndarray, shape (m, 2) — новая точка (двумерная)
         S_fix: np.ndarray, shape (m, 2) — предыдущая точка (двумерная)
+        max_distance: float — максимальная дистанция для соответствий
+        
+        Модифицированная версия с взаимно-однозначным соответствием точек.
+        Каждой точке из одного множества соответствует ровно одна точка из другого.
         """
         src = np.copy(S_move)  # исходная (двигаемая) облако точек
         dst = np.copy(S_fix)  # целевое (фиксированное)
@@ -51,24 +55,60 @@ class ICPNode(Node):
 
         R_global = np.eye(2)
         t_global = np.zeros(2)
-
-        tree = KDTree(dst)
-
+        try:
+            tree = KDTree(dst)
+        except ValueError as e:
+            print(dst)
+            self.get_logger().error(f"Error creating KDTree: {dst}")
+            exit()
+        
         for _ in range(max_iterations):
             # 1. Поиск ближайших соседей
             dist, ind = tree.query(src, k=1)
-            matched_dst = dst[ind.ravel()]
+            dist = dist.ravel()
+            ind = ind.ravel()
+            
+            # Применяем маску по дистанции
+            distance_mask = dist < max_distance
+            # src = src[distance_mask]
+            # matched_dst = dst[ind[distance_mask]]
+            
+            # Фильтруем по дистанции
+            filtered_src_indices = np.where(distance_mask)[0]
+            filtered_dst_indices = ind[distance_mask]
+            filtered_distances = dist[distance_mask]
+            
+            unique_correspondences = {}
+            for i, (src_idx, dst_idx, distance) in enumerate(zip(filtered_src_indices, filtered_dst_indices, filtered_distances)):
+                if dst_idx not in unique_correspondences or distance < unique_correspondences[dst_idx][1]:
+                    unique_correspondences[dst_idx] = (src_idx, distance)
+            
+            # Извлекаем финальные соответствия
+            final_src_indices = []
+            final_dst_indices = []
+            for dst_idx, (src_idx, _) in unique_correspondences.items():
+                final_src_indices.append(src_idx)
+                final_dst_indices.append(dst_idx)
+            
+            final_src_indices = np.array(final_src_indices)
+            final_dst_indices = np.array(final_dst_indices)
+            
+            src = src[final_src_indices]
+            matched_dst = dst[final_dst_indices]
+            
+            if len(src) == 0 or len(matched_dst) == 0:
+                break
 
             # 2. Центроиды
             mean_dst = np.mean(matched_dst, axis=0)
             mean_src = np.mean(src, axis=0)
 
             # 3. Ковариационная матрица
-            Cov = np.einsum('ni,nj->ij', matched_dst - mean_dst, src - mean_src)
+            Cov = np.einsum('ni,nj->ij', src - mean_src, matched_dst - mean_dst)
 
             # 4. SVD и получение поворота
-            U, _, Vt = np.linalg.svd(Cov)
-            R = U.T @ Vt
+            U, _, V = np.linalg.svd(Cov)
+            R = V @ U.T
 
             # 5. Смещение
             t = mean_dst - R @ mean_src
@@ -109,8 +149,8 @@ class ICPNode(Node):
             return
 
         pcd = (self.acum_R @ pcd.T).T + self.acum_t
-
-        t, R = self.icp(pcd, self.global_map, max_iterations=200)
+        
+        t, R = self.icp(pcd, self.global_map, max_iterations=200, max_distance=1.0)
         pcd = (R @ pcd.T).T + t
 
         self.acum_t += self.acum_R @ t 
@@ -119,13 +159,7 @@ class ICPNode(Node):
         self.global_map = np.vstack((self.global_map, pcd))
 
         header = scan.header
-        # self.publish_transform(t, R, header.stamp)
-        # self.publish_map_transform(header.stamp)
-        
         self.publish_map(header)
-        
-        # cloud_msg = self.publish_cloud(pcd, header, 'laser')
-        # self.pc_pub.publish(cloud_msg)
 
         self.prev_pcd = pcd
         
