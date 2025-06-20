@@ -199,3 +199,5 @@ cython_debug/
 build/
 install/
 log/
+bags/
+*.pkl

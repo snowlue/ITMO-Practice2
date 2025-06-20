@@ -5,12 +5,15 @@ from sklearn.neighbors import KDTree
 import pickle
 
 import rclpy
-import tf2_ros
-from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import PointCloud2, PointField
 import sensor_msgs_py.point_cloud2 as pc2
 from sensor_msgs.msg import LaserScan
 from rclpy.node import Node
+
+import tf_transformations
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped, TransformStamped
+import tf2_ros
 
 
 class ICPNode(Node):
@@ -18,11 +21,19 @@ class ICPNode(Node):
         super().__init__('icp_node')
         self.subscription = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.map_pub = self.create_publisher(PointCloud2, '/icp/map', 10)
+        self.path_pub = self.create_publisher(Path, '/icp/path', 10)
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         self.prev_pcd = None
         self.global_map = np.empty((0, 2))
         self.acum_R = np.eye(2)
         self.acum_t = np.zeros(2)
+        
+        self.robot_path = Path()
+        self.robot_path.header.frame_id = 'map'
+        
+        self.robot_position = np.zeros(2)
+        self.robot_orientation = 0.0
 
         self.get_logger().info('ICP node initialized, waiting for /scan…')
 
@@ -37,6 +48,48 @@ class ICPNode(Node):
                 points_list.append((float(self.global_map[i, 0]), float(self.global_map[i, 1]), 0.0))
             cloud_msg = pc2.create_cloud(header, fields, points_list)
             self.map_pub.publish(cloud_msg)
+
+    def publish_path(self, header):
+        self.robot_path.header = header
+        self.robot_path.header.frame_id = 'map'
+        self.path_pub.publish(self.robot_path)
+
+    def add_pose_to_path(self, position, orientation, header):
+        pose_stamped = PoseStamped()
+        pose_stamped.header = header
+        pose_stamped.header.frame_id = 'map'
+        
+        pose_stamped.pose.position.x = float(position[0])
+        pose_stamped.pose.position.y = float(position[1])
+        pose_stamped.pose.position.z = 0.0
+        
+        quat = tf_transformations.quaternion_from_euler(0, 0, orientation)
+        pose_stamped.pose.orientation.x = quat[0]
+        pose_stamped.pose.orientation.y = quat[1]
+        pose_stamped.pose.orientation.z = quat[2]
+        pose_stamped.pose.orientation.w = quat[3]
+        
+        poses_list = list(self.robot_path.poses)
+        poses_list.append(pose_stamped)
+        self.robot_path.poses = poses_list
+
+    def publish_transform(self, header):
+        transform = TransformStamped()
+        transform.header = header
+        transform.header.frame_id = 'map'
+        transform.child_frame_id = 'base_link'
+        
+        transform.transform.translation.x = float(self.robot_position[0])
+        transform.transform.translation.y = float(self.robot_position[1])
+        transform.transform.translation.z = 0.0
+        
+        quat = tf_transformations.quaternion_from_euler(0, 0, self.robot_orientation)
+        transform.transform.rotation.x = quat[0]
+        transform.transform.rotation.y = quat[1]
+        transform.transform.rotation.z = quat[2]
+        transform.transform.rotation.w = quat[3]
+        
+        self.tf_broadcaster.sendTransform(transform)
 
     def icp(self, S_move, S_fix, max_iterations=20, tolerance=1e-6, max_distance=1.0):
         """
@@ -146,10 +199,18 @@ class ICPNode(Node):
         if self.prev_pcd is None:
             self.prev_pcd = pcd
             self.global_map = np.copy(pcd)
-            self.get_logger().info(f'Saved reference scan with {len(pcd)} points. Map size: {self.global_map.shape[0]}')
+            
+            self.robot_position = np.zeros(2)
+            self.robot_orientation = 0.0
             
             header = scan.header
+            self.add_pose_to_path(self.robot_position, self.robot_orientation, header)
+            
+            self.get_logger().info(f'Saved reference scan with {len(pcd)} points. Map size: {self.global_map.shape[0]}')
+            
             self.publish_map(header)
+            self.publish_path(header)
+            self.publish_transform(header)
             return
         
         pcd_norm = np.linalg.norm(pcd, axis=1)
@@ -162,15 +223,30 @@ class ICPNode(Node):
 
         self.acum_t += t 
         self.acum_R = self.acum_R @ R
+        
+        self.robot_position = self.acum_t.copy()
+        
+        self.robot_orientation = math.atan2(self.acum_R[1, 0], self.acum_R[0, 0])
+        
+        header = scan.header
+        self.add_pose_to_path(self.robot_position, self.robot_orientation, header)
 
         self.global_map = np.vstack((self.global_map, pcd))
 
-        header = scan.header
         self.publish_map(header)
+        self.publish_path(header)
+        self.publish_transform(header)
 
         self.prev_pcd = pcd
         
-        self.get_logger().info(f'Added {len(pcd)} points to map. Total map size: {self.global_map.shape[0]} points')
+        self.get_logger().info(f'Added {len(pcd)} points to map. Total map size: {self.global_map.shape[0]} points. Robot pos: ({self.robot_position[0]:.2f}, {self.robot_position[1]:.2f}), orientation: {math.degrees(self.robot_orientation):.1f}°')
+
+        self.robot_position = self.acum_t
+        self.robot_orientation = math.atan2(self.acum_R[1, 0], self.acum_R[0, 0])
+        
+        self.add_pose_to_path(self.robot_position, self.robot_orientation, header)
+        self.publish_path(header)
+        self.publish_transform(header)
 
 
 def main(args=None):
