@@ -49,6 +49,11 @@ class ICPNode(Node):
         """
         src = np.copy(S_move)  # исходная (двигаемая) облако точек
         dst = np.copy(S_fix)  # целевое (фиксированное)
+
+        dst_norm = np.linalg.norm(dst, axis=1)
+        dst = dst[dst_norm > 0.1]
+
+        P = np.copy(src)
         
         R = np.eye(2)
         t = np.zeros(2)
@@ -64,68 +69,67 @@ class ICPNode(Node):
         
         for _ in range(max_iterations):
             # 1. Поиск ближайших соседей
-            dist, ind = tree.query(src, k=1)
+            dist, ind = tree.query(P, k=1)
             dist = dist.ravel()
             ind = ind.ravel()
             
             # Применяем маску по дистанции
             distance_mask = dist < max_distance
-            # src = src[distance_mask]
-            # matched_dst = dst[ind[distance_mask]]
+            P = P[distance_mask]
+            matched_dst = dst[ind[distance_mask]]
             
             # Фильтруем по дистанции
-            filtered_src_indices = np.where(distance_mask)[0]
-            filtered_dst_indices = ind[distance_mask]
-            filtered_distances = dist[distance_mask]
+            # filtered_src_indices = np.where(distance_mask)[0]
+            # filtered_dst_indices = ind[distance_mask]
+            # filtered_distances = dist[distance_mask]
             
-            unique_correspondences = {}
-            for i, (src_idx, dst_idx, distance) in enumerate(zip(filtered_src_indices, filtered_dst_indices, filtered_distances)):
-                if dst_idx not in unique_correspondences or distance < unique_correspondences[dst_idx][1]:
-                    unique_correspondences[dst_idx] = (src_idx, distance)
+            # unique_correspondences = {}
+            # for i, (src_idx, dst_idx, distance) in enumerate(zip(filtered_src_indices, filtered_dst_indices, filtered_distances)):
+            #     if dst_idx not in unique_correspondences or distance < unique_correspondences[dst_idx][1]:
+            #         unique_correspondences[dst_idx] = (src_idx, distance)
             
             # Извлекаем финальные соответствия
-            final_src_indices = []
-            final_dst_indices = []
-            for dst_idx, (src_idx, _) in unique_correspondences.items():
-                final_src_indices.append(src_idx)
-                final_dst_indices.append(dst_idx)
+            # final_src_indices = []
+            # final_dst_indices = []
+            # for dst_idx, (src_idx, _) in unique_correspondences.items():
+            #     final_src_indices.append(src_idx)
+            #     final_dst_indices.append(dst_idx)
             
-            final_src_indices = np.array(final_src_indices)
-            final_dst_indices = np.array(final_dst_indices)
+            # final_src_indices = np.array(final_src_indices)
+            # final_dst_indices = np.array(final_dst_indices)
             
-            src = src[final_src_indices]
-            matched_dst = dst[final_dst_indices]
+            # P = P[final_src_indices]
+            # matched_dst = dst[final_dst_indices]
             
-            if len(src) == 0 or len(matched_dst) == 0:
-                break
+            # if len(src) == 0 or len(matched_dst) == 0:
+            #     break
 
             # 2. Центроиды
             mean_dst = np.mean(matched_dst, axis=0)
-            mean_src = np.mean(src, axis=0)
+            mean_src = np.mean(P, axis=0)
 
             # 3. Ковариационная матрица
-            Cov = np.einsum('ni,nj->ij', src - mean_src, matched_dst - mean_dst)
+            Cov = (P - mean_src).T @ (matched_dst - mean_dst) 
 
             # 4. SVD и получение поворота
-            U, _, V = np.linalg.svd(Cov)
-            R = V @ U.T
+            U, _, Vh = np.linalg.svd(Cov)
+            R = Vh.T @ U.T
+
 
             # 5. Смещение
             t = mean_dst - R @ mean_src
 
             # 6. Применяем трансформацию
-            src_transformed = (R @ src.T).T + t
+            P = (R @ P.T).T + t
 
-            t_global += R_global @ t
+            t_global += t
             R_global = R @ R_global
 
             # Проверка сходимости
-            if np.linalg.norm(src_transformed - src) < tolerance:
+            if np.linalg.norm(P - matched_dst) < tolerance:
                 break
 
-            src = src_transformed
-
-        return t_global, R_global
+        return src, t_global, R_global
 
     def scan_callback(self, scan: LaserScan):
         angles = np.linspace(scan.angle_min, scan.angle_max, len(scan.ranges))
@@ -137,7 +141,7 @@ class ICPNode(Node):
         ys = ranges * np.sin(angles)
         pcd = np.vstack((xs, ys)).T
 
-        history.append((pcd.copy()))
+        # history.append((pcd.copy()))
 
         if self.prev_pcd is None:
             self.prev_pcd = pcd
@@ -147,13 +151,16 @@ class ICPNode(Node):
             header = scan.header
             self.publish_map(header)
             return
+        
+        pcd_norm = np.linalg.norm(pcd, axis=1)
+        pcd = pcd[pcd_norm > 0.1]
 
         pcd = (self.acum_R @ pcd.T).T + self.acum_t
         
-        t, R = self.icp(pcd, self.global_map, max_iterations=200, max_distance=1.0)
+        pcd, t, R = self.icp(pcd, self.global_map, max_iterations=100, max_distance=1.0)
         pcd = (R @ pcd.T).T + t
 
-        self.acum_t += self.acum_R @ t 
+        self.acum_t += t 
         self.acum_R = self.acum_R @ R
 
         self.global_map = np.vstack((self.global_map, pcd))
@@ -178,7 +185,9 @@ def main(args=None):
 
 def on_shutdown():
     if history:
-        pickle.dump(history, open('icp_history.pkl', 'wb'))
+        ...
+        # pickle.dump(history, open('icp_history_rotation.pkl', 'wb'))
+        # pickle.dump(history, open('map.pkl', 'wb'))
     else:
         print("No history to save.")
 
