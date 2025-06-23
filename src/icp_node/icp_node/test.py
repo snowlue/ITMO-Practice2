@@ -1,8 +1,8 @@
+import pickle
+
+import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.neighbors import KDTree
-import matplotlib.pyplot as plt
-
-import pickle
 
 
 def icp(S_move, S_fix, max_iterations=20, tolerance=1e-6, max_distance=1.0, threshold_iter=20):
@@ -12,7 +12,7 @@ def icp(S_move, S_fix, max_iterations=20, tolerance=1e-6, max_distance=1.0, thre
     """
     src = np.copy(S_move)  # исходная (двигаемая) облако точек
     dst = np.copy(S_fix)  # целевое (фиксированное)
-    
+
     src_n = np.linalg.norm(src, axis=1)
     dst_n = np.linalg.norm(dst, axis=1)
     src = src[src_n > 0.1]
@@ -73,13 +73,12 @@ def icp(S_move, S_fix, max_iterations=20, tolerance=1e-6, max_distance=1.0, thre
         P = P[distance_mask]
         matched_dst = dst[ind[distance_mask]]
 
-                
         # 2. Центроиды
         mean_dst = np.mean(matched_dst, axis=0)
         mean_src = np.mean(P, axis=0)
 
         # 3. Ковариационная матрица
-        Cov = (P - mean_src).T @ (matched_dst - mean_dst) 
+        Cov = (P - mean_src).T @ (matched_dst - mean_dst)
         # 4. SVD и получение поворота
         U, _, Vh = np.linalg.svd(Cov)
         R = Vh.T @ U.T
@@ -99,7 +98,7 @@ def icp(S_move, S_fix, max_iterations=20, tolerance=1e-6, max_distance=1.0, thre
 
     plt.clf()
     plt.scatter(dst[:, 0], dst[:, 1], s=20, c='green', alpha=0.5, label='Карта')
-    plt.scatter(src[:, 0], src[:, 1], s=5, c='gray', alpha=0.3, label=f'Исходные точки')
+    plt.scatter(src[:, 0], src[:, 1], s=5, c='gray', alpha=0.3, label='Исходные точки')
     plt.scatter(P[:, 0], P[:, 1], s=20, alpha=0.7, c='blue', label='Итоговый результат')
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -107,7 +106,6 @@ def icp(S_move, S_fix, max_iterations=20, tolerance=1e-6, max_distance=1.0, thre
     # plt.show()
 
     return t_global, R_global
-    
 
 
 pcd = pickle.load(open('icp_history_rotation.pkl', 'rb'))
@@ -131,7 +129,7 @@ for i in range(1, len(pcd)):
     if i > 40 and i % 5 == 0:
         plt.show()
     # if i == 400:
-        # pickle.dump([map, g_t, g_R], open('map_400.pkl', 'wb'))
+    # pickle.dump([map, g_t, g_R], open('map_400.pkl', 'wb'))
 # pcd1 = pcd[40]
 # pcd2 = pcd[55]
 

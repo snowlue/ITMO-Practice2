@@ -1,21 +1,20 @@
-import rclpy
-from rclpy.node import Node
-from rclpy.executors import ExternalShutdownException
-from std_msgs.msg import String, Header
-from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Pose, Twist, Quaternion, TransformStamped
-from tf2_ros import TransformBroadcaster
-import time
-import threading
 import socket
 import struct
+import threading
+import time
+
+import rclpy
+from geometry_msgs.msg import Quaternion, TransformStamped, Twist
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from tf2_ros import TransformBroadcaster
 from transforms3d.euler import euler2quat
 
 
 class DriverNode(Node):
     def __init__(self):
         super().__init__('driver_node')
-        self.outputSignals = [0, 0, 0, 0]
+        self.outputSignals: list[float] = [0, 0, 0, 0]
         self.publisher = self.create_publisher(Odometry, '/odom', 10)
         self.subscribtion = self.create_subscription(Twist, '/cmd_vel', self.listener_callback, 10)
         self.tf_broadcaster = TransformBroadcaster(self)
