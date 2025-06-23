@@ -34,6 +34,9 @@ class ICPNode(Node):
         self.x_min, self.y_min = -10.0, -10.0
         self.width = int(np.ceil(20.0 / self.resolution))
         self.height = int(np.ceil(20.0 / self.resolution))
+
+        self.persistent_map_data = [-1] * (self.width * self.height)
+
         self.og = OccupancyGrid()
         self.og.header.frame_id = 'map'
         self.og.info = MapMetaData()
@@ -54,22 +57,35 @@ class ICPNode(Node):
         if self.global_map.size == 0:
             return
 
-        now = self.get_clock().now().to_msg()
-        self.og.header.stamp = now
-
-        self.og.data = [-1] * (self.width * self.height)
+        map_header = header
+        og = OccupancyGrid()
+        og.header = map_header
+        og.header.frame_id = 'map'
+        og.info = MapMetaData()
+        og.info.resolution = self.resolution
+        og.info.width = self.width
+        og.info.height = self.height
+        og.info.origin.position.x = self.x_min
+        og.info.origin.position.y = self.y_min
+        og.info.origin.orientation.w = 1.0
+        self.og.header.stamp = map_header.stamp
 
         rx = int((self.robot_position[0] - self.x_min) / self.resolution)
         ry = int((self.robot_position[1] - self.y_min) / self.resolution)
-
+        
         if not (0 <= rx < self.width and 0 <= ry < self.height):
-            self.get_logger().warn(f'Robot position ({rx}, {ry}) is outside map bounds')
+            self.get_logger().warn(f"Robot position ({rx}, {ry}) is outside map bounds")
             return
 
         if len(self.global_map.shape) != 2 or self.global_map.shape[0] == 0:
             return
 
-        for i in range(self.global_map.shape[0]):
+        max_points = min(1000, self.global_map.shape[0])
+        step = max(1, self.global_map.shape[0] // max_points)
+        
+        start_idx = max(0, self.global_map.shape[0] - len(self.prev_pcd) if self.prev_pcd is not None else 0)
+        
+        for i in range(start_idx, self.global_map.shape[0], max(1, step)):
             x, y = self.global_map[i, 0], self.global_map[i, 1]
             grid_x = int((x - self.x_min) / self.resolution)
             grid_y = int((y - self.y_min) / self.resolution)
@@ -79,13 +95,14 @@ class ICPNode(Node):
             for cx, cy in self.bresenham(rx, ry, grid_x, grid_y):
                 if 0 <= cx < self.width and 0 <= cy < self.height:
                     idx = cy * self.width + cx
-                    if self.og.data[idx] == -1:
-                        self.og.data[idx] = 0
+                    if self.persistent_map_data[idx] == -1:
+                        self.persistent_map_data[idx] = 0
 
             if 0 <= grid_x < self.width and 0 <= grid_y < self.height:
-                self.og.data[grid_y * self.width + grid_x] = 100
+                self.persistent_map_data[grid_y * self.width + grid_x] = 100
 
-        self.og_pub.publish(self.og)
+        og.data = list(self.persistent_map_data)
+        self.og_pub.publish(og)
 
     def bresenham(self, x0, y0, x1, y1):
         cells = []
@@ -243,6 +260,9 @@ class ICPNode(Node):
         xs = ranges * np.cos(angles)
         ys = ranges * np.sin(angles)
         pcd = np.vstack((xs, ys)).T
+        
+        pcd_norm = np.linalg.norm(pcd, axis=1)
+        pcd = pcd[pcd_norm > 0.1]
 
         # history.append((pcd.copy()))
 
@@ -262,9 +282,6 @@ class ICPNode(Node):
             self.publish_map(header)
             self.publish_pc(header)
             return
-
-        pcd_norm = np.linalg.norm(pcd, axis=1)
-        pcd = pcd[pcd_norm > 0.1]
 
         pcd = (self.acum_R @ pcd.T).T + self.acum_t
 
