@@ -201,3 +201,5 @@ install/
 log/
 bags/
 *.pkl
+
+**/.obsidian/
