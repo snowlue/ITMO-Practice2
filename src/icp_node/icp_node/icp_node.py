@@ -169,6 +169,7 @@ class ICPNode(Node):
         poses_list = list(self.robot_path.poses)
         poses_list.append(pose_stamped)
         self.robot_path.poses = poses_list
+        
 
     def publish_transform(self, header):
         transform = TransformStamped()
@@ -311,6 +312,7 @@ class ICPNode(Node):
 
 
 def main(args=None):
+    global history
     rclpy.init(args=args)
     node = ICPNode()
     try:
@@ -318,6 +320,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # history = node.robot_path
         on_shutdown()
 
 
@@ -326,6 +329,7 @@ def on_shutdown():
         ...
         # pickle.dump(history, open('icp_history_rotation.pkl', 'wb'))
         # pickle.dump(history, open('map.pkl', 'wb'))
+        # pickle.dump(history, open('robot_path_map_6.pkl', 'wb'))
     else:
         print('No history to save.')
 

@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import cv2
 import numpy as np
 import rclpy
@@ -35,7 +33,6 @@ class SLAMNode(Node):
         self.get_logger().info('SLAM Node initialized, waiting for camera info and data...')
     
     def camera_info_callback(self, msg):
-        """Получение параметров камеры"""
         if not self.camera_info_received:
             self.camera_matrix = np.array(msg.k).reshape(3, 3)
             self.dist_coeffs = np.array(msg.d)
@@ -43,7 +40,6 @@ class SLAMNode(Node):
             self.get_logger().info('Camera info received')
     
     def image_callback(self, msg):
-        """Callback для обработки изображений"""
         if not self.camera_info_received:
             return
             
