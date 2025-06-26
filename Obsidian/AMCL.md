@@ -56,4 +56,4 @@ Algorithm sample_landmark_model_known_correspondence(f_t^i, c_t^i, m):
     θ = γ_hat - π - φ_hat
     return (x, y, θ)ᵀ
 ```
-Это алгоритм выборки позиций на основе измерения ориентиров $f_t^i = (r_t^i\quad \varphi_t^i\quad s_t^i)^T$ с известной идентичностью $c_t^i$.
+
