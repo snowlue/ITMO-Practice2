@@ -200,6 +200,5 @@ build/
 install/
 log/
 bags/
-*.pkl
 
 **/.obsidian/
