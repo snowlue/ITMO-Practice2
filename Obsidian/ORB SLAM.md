@@ -13,7 +13,7 @@
 corners, ids, _ = cv2.aruco.detectMarkers(frame, aruco_dict, parameters=aruco_params)
 rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, marker_length, K, distCoeffs)
 ```
-2. Для каждого найденного маркера iii строим однородную матрицу:
+2. Для каждого найденного маркера $i$ строим однородную матрицу:
 
 $$T_{\text{cam}\to i} = \begin{bmatrix} R(rvec_i) & tvec_i \\ 0\;0\;0 & 1 \end{bmatrix},$$
 
