@@ -37,11 +37,6 @@ class SLAMNode(Node):
         self.global_points = []      # накопленные глобальные точки
         self.reference_marker_id = None  # ID опорного маркера
         
-        # Стабилизация
-        self.last_camera_transform = None
-        self.transform_history = []
-        self.max_history = 5
-        
         # TF broadcasters
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -259,24 +254,6 @@ class SLAMNode(Node):
             # Fallback к единичному кватерниону
             return 1.0, 0.0, 0.0, 0.0
     
-    def is_transform_stable(self, T_new):
-        """Проверить стабильность трансформации"""
-        if self.last_camera_transform is None:
-            return True
-        
-        # Вычислить разность позиций
-        pos_diff = np.linalg.norm(T_new[:3, 3] - self.last_camera_transform[:3, 3])
-        
-        # Вычислить разность ориентаций
-        R_diff = T_new[:3, :3] @ self.last_camera_transform[:3, :3].T
-        angle_diff = np.abs(np.arccos(np.clip((np.trace(R_diff) - 1) / 2, -1, 1)))
-        
-        # Проверить пороги
-        max_pos_change = 0.5  # 50 см
-        max_angle_change = np.pi / 4  # 45 градусов
-        
-        return pos_diff < max_pos_change and angle_diff < max_angle_change
-    
     def invert_transform(self, T):
         """Инвертировать однородную матрицу трансформации"""
         T_inv = np.eye(4)
@@ -314,25 +291,9 @@ class SLAMNode(Node):
         self.static_tf_broadcaster.sendTransform(t)
     
     def publish_camera_transform(self, T_world_camera):
-        """Публиковать динамический трансформ камеры с стабилизацией"""
-        # Проверить стабильность
-        if not self.is_transform_stable(T_world_camera):
-            self.get_logger().warn('Unstable camera transform detected, skipping...')
-            return
-        
-        # Добавить в историю для сглаживания
-        self.transform_history.append(T_world_camera.copy())
-        if len(self.transform_history) > self.max_history:
-            self.transform_history.pop(0)
-        
-        # Усреднить трансформации для стабилизации
-        if len(self.transform_history) >= 3:
-            avg_translation = np.mean([T[:3, 3] for T in self.transform_history], axis=0)
-            # Для поворотов используем последнюю трансформацию (усреднение кватернионов сложнее)
-            T_smoothed = T_world_camera.copy()
-            T_smoothed[:3, 3] = avg_translation
-        else:
-            T_smoothed = T_world_camera
+        """Публиковать динамический трансформ камеры"""
+        # Убран фильтр стабильности - публикуем все трансформации
+        T_smoothed = T_world_camera
         
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
@@ -352,7 +313,6 @@ class SLAMNode(Node):
         t.transform.rotation.z = float(z)
         
         self.dynamic_tf_broadcaster.sendTransform(t)
-        self.last_camera_transform = T_smoothed.copy()
 
 
 def main(args=None):
