@@ -1,11 +1,14 @@
 import cv2
 import numpy as np
 import rclpy
-import tf_transformations
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
-from visualization_msgs.msg import Marker, MarkerArray
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2
 from cv_bridge import CvBridge
+from sensor_msgs_py import point_cloud2 as pc2
+import tf2_ros
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import StaticTransformBroadcaster
+from scipy.spatial.transform import Rotation as R
 
 
 class SLAMNode(Node):
@@ -15,13 +18,11 @@ class SLAMNode(Node):
         self.bridge = CvBridge()
         
         self.color_sub = self.create_subscription(
-            Image, '/camera/camera/color/image_raw', self.image_callback, 10
+            Image, '/camera/camera/color/image_rect_color', self.image_callback, 10
         )
         self.info_sub = self.create_subscription(
             CameraInfo, '/camera/camera/color/camera_info', self.camera_info_callback, 10
         )
-        
-        self.marker_pub = self.create_publisher(MarkerArray, '/slam/aruco_markers', 10)
         
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
         self.aruco_params = cv2.aruco.DetectorParameters()
@@ -29,8 +30,26 @@ class SLAMNode(Node):
         self.camera_matrix = None
         self.dist_coeffs = None
         self.camera_info_received = False
+        self.marker_size = 0.093
+        
+        # SLAM карта - хранение трансформаций маркеров
+        self.marker_transforms = {}  # marker_id -> T_world_marker (4x4 matrix)
+        self.global_points = []      # накопленные глобальные точки
+        self.reference_marker_id = None  # ID опорного маркера
+        
+        # Стабилизация
+        self.last_camera_transform = None
+        self.transform_history = []
+        self.max_history = 5
+        
+        # TF broadcasters
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self.dynamic_tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         
         self.get_logger().info('SLAM Node initialized, waiting for camera info and data...')
+        self.pc_pub = self.create_publisher(PointCloud2, '/slam/keyframe_cloud', 10)
     
     def camera_info_callback(self, msg):
         if not self.camera_info_received:
@@ -57,172 +76,283 @@ class SLAMNode(Node):
         corners, ids, _ = detector.detectMarkers(gray_image)
 
         if ids is not None and len(ids) > 0:
-            marker_size = 0.1
             if self.camera_matrix is not None and self.dist_coeffs is not None:
+                # 4. Оценка позы маркеров
                 rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                    corners, marker_size, self.camera_matrix, self.dist_coeffs
+                    corners, self.marker_size, self.camera_matrix, self.dist_coeffs
                 )
 
-                markers_list = []
-                marker_array = MarkerArray()
-
+                new_markers_found = False
+                detected_markers = {}
+                
+                # Построить матрицы трансформации для всех детектированных маркеров
                 for i in range(len(ids)):
                     marker_id = int(ids[i][0])
                     rvec = rvecs[i][0]
                     tvec = tvecs[i][0]
+                    
+                    # Построить трансформацию T_camera←marker (ArUco дает позицию маркера в камере)
+                    T_camera_marker = self.build_homogeneous_transform(rvec, tvec)
+                    detected_markers[marker_id] = T_camera_marker
+                    
+                    self.get_logger().info(f'Detected ArUco marker {marker_id} at position: x={tvec[0]:.3f}, y={tvec[1]:.3f}, z={tvec[2]:.3f}')
 
-                    R, _ = cv2.Rodrigues(rvec)
+                # 5. Определение мировых трансформов
+                if len(self.marker_transforms) == 0:
+                    # Карта пуста - первый маркер становится опорным в начале координат
+                    first_marker_id = list(detected_markers.keys())[0]
+                    
+                    # Устанавливаем первый маркер в начале координат мировой системы
+                    # T_world←marker = I (единичная матрица)
+                    T_world_marker0 = np.eye(4)
+                    
+                    self.marker_transforms[first_marker_id] = T_world_marker0
+                    self.reference_marker_id = first_marker_id
+                    new_markers_found = True
+                    
+                    self.get_logger().info(f'Initialized map with reference marker {first_marker_id} at world origin')
+                else:
+                    # Карта существует - обрабатываем новые маркеры
+                    reference_marker_in_view = None
+                    T_camera_ref = None
+                    
+                    # Найти наиболее стабильный опорный маркер среди детектированных
+                    # Предпочитаем маркер с наименьшим ID для консистентности
+                    known_markers = []
+                    for marker_id in detected_markers.keys():
+                        if marker_id in self.marker_transforms:
+                            known_markers.append(marker_id)
+                    
+                    if known_markers:
+                        # Выбрать маркер с наименьшим ID для стабильности
+                        reference_marker_in_view = min(known_markers)
+                        T_camera_ref = detected_markers[reference_marker_in_view]
+                        
+                        # Есть опорный маркер в кадре - можем добавлять новые
+                        T_world_ref = self.marker_transforms[reference_marker_in_view]
+                        
+                        for marker_id, T_camera_marker in detected_markers.items():
+                            if marker_id not in self.marker_transforms:
+                                # Новый маркер: вычисляем его позицию в мировых координатах
+                                # T_world←M_new = T_world←M_ref + относительная позиция между маркерами
+                                
+                                # Относительная трансформация: T_ref←new = T_camera←ref * T_camera←new^-1
+                                T_camera_ref_inv = self.invert_transform(T_camera_ref)
+                                T_ref_new = T_camera_ref_inv @ T_camera_marker
+                                
+                                # Глобальная позиция: T_world←new = T_world←ref * T_ref←new
+                                T_world_marker = T_world_ref @ T_ref_new
+                                
+                                self.marker_transforms[marker_id] = T_world_marker
+                                new_markers_found = True
+                                
+                                self.get_logger().info(f'Added new marker {marker_id} to map using reference {reference_marker_in_view}')
 
-                    T = np.eye(4)
-                    T[:3, :3] = R
-                    T[:3, 3] = tvec
-                    quat = tf_transformations.quaternion_from_matrix(T)
+                # 6. Преобразование точек в глобальные координаты
+                current_points = []
+                
+                # Локальные координаты углов маркера
+                half = self.marker_size / 2.0
+                local_corners = np.array([
+                    [-half,  half, 0, 1],
+                    [ half,  half, 0, 1],
+                    [ half, -half, 0, 1],
+                    [-half, -half, 0, 1]
+                ])
+                local_center = np.array([0, 0, 0, 1])
+                
+                for marker_id in detected_markers.keys():
+                    if marker_id in self.marker_transforms:
+                        T_world_marker = self.marker_transforms[marker_id]
+                        
+                        # Преобразовать углы маркера в глобальные координаты
+                        for corner in local_corners:
+                            p_world = T_world_marker @ corner
+                            current_points.append([p_world[0], p_world[1], p_world[2]])
+                        
+                        # Преобразовать центр маркера в глобальные координаты
+                        c_world = T_world_marker @ local_center
+                        current_points.append([c_world[0], c_world[1], c_world[2]])
 
-                    cube_marker = Marker()
-                    cube_marker.header = header
-                    cube_marker.header.frame_id = 'camera_link'
-                    cube_marker.ns = "aruco_cubes"
-                    cube_marker.id = marker_id
-                    cube_marker.type = Marker.CUBE
-                    cube_marker.action = Marker.ADD
+                # Добавить новые точки к глобальному облаку при обнаружении новых маркеров
+                if new_markers_found:
+                    self.global_points.extend(current_points)
+                    self.publish_static_transforms()
+                
+                # Всегда публиковать облако точек всех известных маркеров
+                all_points = []
+                for marker_id in self.marker_transforms.keys():
+                    T_world_marker = self.marker_transforms[marker_id]
+                    
+                    # Добавить углы маркера
+                    for corner in local_corners:
+                        p_world = T_world_marker @ corner
+                        all_points.append([p_world[0], p_world[1], p_world[2]])
+                    
+                    # Добавить центр маркера
+                    c_world = T_world_marker @ local_center
+                    all_points.append([c_world[0], c_world[1], c_world[2]])
 
-                    cube_marker.pose.position.x = float(tvec[0])
-                    cube_marker.pose.position.y = float(tvec[1])
-                    cube_marker.pose.position.z = float(tvec[2])
+                # 7. Публикация облака точек
+                if len(all_points) > 0:
+                    # Создать header с world frame
+                    world_header = header
+                    world_header.frame_id = 'world'
+                    
+                    cloud_msg = pc2.create_cloud_xyz32(world_header, all_points)
+                    self.pc_pub.publish(cloud_msg)
 
-                    cube_marker.pose.orientation.x = quat[0]
-                    cube_marker.pose.orientation.y = quat[1]
-                    cube_marker.pose.orientation.z = quat[2]
-                    cube_marker.pose.orientation.w = quat[3]
+                # 8. Локализация камеры в готовой карте
+                if len(detected_markers) > 0:
+                    # Найти наиболее надежный известный маркер для вычисления позиции камеры
+                    # Предпочитаем маркер с наименьшим ID для консистентности
+                    camera_localized = False
+                    known_markers_sorted = sorted([mid for mid in detected_markers.keys() 
+                                                 if mid in self.marker_transforms])
+                    
+                    for marker_id in known_markers_sorted:
+                        T_camera_marker = detected_markers[marker_id]
+                        T_world_marker = self.marker_transforms[marker_id]
+                        
+                        # Позиция камеры в мировых координатах:
+                        # T_world←camera = T_world←marker * T_marker←camera
+                        # где T_marker←camera = T_camera←marker^-1
+                        T_marker_camera = self.invert_transform(T_camera_marker)
+                        T_world_camera = T_world_marker @ T_marker_camera
+                        
+                        self.publish_camera_transform(T_world_camera)
+                        camera_localized = True
+                        break
+                    
+                    if not camera_localized:
+                        self.get_logger().warn('Could not localize camera - no known markers detected')
 
-                    cube_marker.scale.x = marker_size
-                    cube_marker.scale.y = marker_size
-                    cube_marker.scale.z = 0.01  # Тонкий куб
-
-                    cube_marker.color.r = 1.0
-                    cube_marker.color.g = 1.0
-                    cube_marker.color.b = 0.0
-                    cube_marker.color.a = 0.8
-
-                    markers_list.append(cube_marker)
-
-                    axis_length = marker_size * 1.5
-                    axis_width = 0.005
-
-                    x_axis = Marker()
-                    x_axis.header = header
-                    x_axis.header.frame_id = 'camera_link'
-                    x_axis.ns = "aruco_axes"
-                    x_axis.id = marker_id * 10 + 1
-                    x_axis.type = Marker.ARROW
-                    x_axis.action = Marker.ADD
-
-                    x_axis.pose.position.x = float(tvec[0])
-                    x_axis.pose.position.y = float(tvec[1])
-                    x_axis.pose.position.z = float(tvec[2])
-                    x_axis.pose.orientation = cube_marker.pose.orientation
-
-                    x_axis.scale.x = axis_length
-                    x_axis.scale.y = axis_width
-                    x_axis.scale.z = axis_width
-
-                    x_axis.color.r = 1.0
-                    x_axis.color.g = 0.0
-                    x_axis.color.b = 0.0
-                    x_axis.color.a = 1.0
-
-                    markers_list.append(x_axis)
-
-                    y_axis = Marker()
-                    y_axis.header = header
-                    y_axis.header.frame_id = 'camera_link'
-                    y_axis.ns = "aruco_axes"
-                    y_axis.id = marker_id * 10 + 2
-                    y_axis.type = Marker.ARROW
-                    y_axis.action = Marker.ADD
-
-                    y_axis.pose.position.x = float(tvec[0])
-                    y_axis.pose.position.y = float(tvec[1])
-                    y_axis.pose.position.z = float(tvec[2])
-
-                    y_rotation = tf_transformations.quaternion_from_euler(0, 0, np.pi/2)
-                    marker_quat = [quat[0], quat[1], quat[2], quat[3]]
-                    combined_quat = tf_transformations.quaternion_multiply(marker_quat, y_rotation)
-
-                    y_axis.pose.orientation.x = combined_quat[0]
-                    y_axis.pose.orientation.y = combined_quat[1]
-                    y_axis.pose.orientation.z = combined_quat[2]
-                    y_axis.pose.orientation.w = combined_quat[3]
-
-                    y_axis.scale.x = axis_length
-                    y_axis.scale.y = axis_width
-                    y_axis.scale.z = axis_width
-
-                    y_axis.color.r = 0.0
-                    y_axis.color.g = 1.0
-                    y_axis.color.b = 0.0
-                    y_axis.color.a = 1.0
-
-                    markers_list.append(y_axis)
-
-                    z_axis = Marker()
-                    z_axis.header = header
-                    z_axis.header.frame_id = 'camera_link'
-                    z_axis.ns = "aruco_axes"
-                    z_axis.id = marker_id * 10 + 3
-                    z_axis.type = Marker.ARROW
-                    z_axis.action = Marker.ADD
-
-                    z_axis.pose.position.x = float(tvec[0])
-                    z_axis.pose.position.y = float(tvec[1])
-                    z_axis.pose.position.z = float(tvec[2])
-
-                    z_rotation = tf_transformations.quaternion_from_euler(0, -np.pi/2, 0)
-                    combined_quat = tf_transformations.quaternion_multiply(marker_quat, z_rotation)
-
-                    z_axis.pose.orientation.x = combined_quat[0]
-                    z_axis.pose.orientation.y = combined_quat[1]
-                    z_axis.pose.orientation.z = combined_quat[2]
-                    z_axis.pose.orientation.w = combined_quat[3]
-
-                    z_axis.scale.x = axis_length
-                    z_axis.scale.y = axis_width
-                    z_axis.scale.z = axis_width
-
-                    z_axis.color.r = 0.0
-                    z_axis.color.g = 0.0
-                    z_axis.color.b = 1.0
-                    z_axis.color.a = 1.0
-
-                    markers_list.append(z_axis)
-
-                    text_marker = Marker()
-                    text_marker.header = header
-                    text_marker.header.frame_id = 'camera_link'
-                    text_marker.ns = "aruco_text"
-                    text_marker.id = marker_id * 10 + 4
-                    text_marker.type = Marker.TEXT_VIEW_FACING
-                    text_marker.action = Marker.ADD
-
-                    text_marker.pose.position.x = float(tvec[0])
-                    text_marker.pose.position.y = float(tvec[1])
-                    text_marker.pose.position.z = float(tvec[2]) + axis_length
-
-                    text_marker.scale.z = 0.02
-
-                    text_marker.color.r = 1.0
-                    text_marker.color.g = 1.0
-                    text_marker.color.b = 1.0
-                    text_marker.color.a = 1.0
-
-                    text_marker.text = f"ArUco {marker_id}"
-
-                    markers_list.append(text_marker)
-
-                marker_array.markers = markers_list
-
-                self.marker_pub.publish(marker_array)
-                self.get_logger().info(f'Published visualization for {len(ids)} ArUco markers')
+                self.get_logger().info(f'Processed {len(ids)} ArUco markers, map contains {len(self.marker_transforms)} markers')
+    
+    def build_homogeneous_transform(self, rvec, tvec):
+        """Построить однородную матрицу трансформации 4x4 из rvec и tvec"""
+        R_mat, _ = cv2.Rodrigues(rvec)
+        T = np.eye(4)
+        T[:3, :3] = R_mat
+        T[:3, 3] = tvec
+        return T
+    
+    def camera_to_marker_transform(self, rvec, tvec):
+        """Построить трансформацию T_marker←camera из ArUco данных"""
+        # ArUco возвращает позицию и ориентацию маркера в системе координат камеры
+        # Нам нужна трансформация из камеры в маркер
+        R_mat, _ = cv2.Rodrigues(rvec)
+        
+        # T_marker←camera = [R^T, -R^T * t; 0, 1]
+        T = np.eye(4)
+        T[:3, :3] = R_mat.T  # Транспонированная матрица поворота
+        T[:3, 3] = -R_mat.T @ tvec  # Инвертированное смещение
+        return T
+    
+    def rotation_matrix_to_quaternion(self, R_mat):
+        """Конвертировать матрицу поворота в кватернион используя scipy"""
+        try:
+            rotation = R.from_matrix(R_mat)
+            quat = rotation.as_quat()  # [x, y, z, w]
+            return quat[3], quat[0], quat[1], quat[2]  # [w, x, y, z]
+        except Exception:
+            # Fallback к единичному кватерниону
+            return 1.0, 0.0, 0.0, 0.0
+    
+    def is_transform_stable(self, T_new):
+        """Проверить стабильность трансформации"""
+        if self.last_camera_transform is None:
+            return True
+        
+        # Вычислить разность позиций
+        pos_diff = np.linalg.norm(T_new[:3, 3] - self.last_camera_transform[:3, 3])
+        
+        # Вычислить разность ориентаций
+        R_diff = T_new[:3, :3] @ self.last_camera_transform[:3, :3].T
+        angle_diff = np.abs(np.arccos(np.clip((np.trace(R_diff) - 1) / 2, -1, 1)))
+        
+        # Проверить пороги
+        max_pos_change = 0.5  # 50 см
+        max_angle_change = np.pi / 4  # 45 градусов
+        
+        return pos_diff < max_pos_change and angle_diff < max_angle_change
+    
+    def invert_transform(self, T):
+        """Инвертировать однородную матрицу трансформации"""
+        T_inv = np.eye(4)
+        R = T[:3, :3]
+        t = T[:3, 3]
+        T_inv[:3, :3] = R.T
+        T_inv[:3, 3] = -R.T @ t
+        return T_inv
+    
+    def publish_static_transforms(self):
+        """Публиковать статические трансформы всех известных маркеров"""
+        for marker_id, T_world_marker in self.marker_transforms.items():
+            self.publish_marker_transform(marker_id, T_world_marker)
+    
+    def publish_marker_transform(self, marker_id, T_world_marker):
+        """Публиковать статический трансформ маркера"""
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = 'world'
+        t.child_frame_id = f'marker_{marker_id}'
+        
+        # Извлечь позицию
+        t.transform.translation.x = float(T_world_marker[0, 3])
+        t.transform.translation.y = float(T_world_marker[1, 3])
+        t.transform.translation.z = float(T_world_marker[2, 3])
+        
+        # Конвертировать матрицу поворота в кватернион
+        R_mat = T_world_marker[:3, :3]
+        w, x, y, z = self.rotation_matrix_to_quaternion(R_mat)
+        t.transform.rotation.w = float(w)
+        t.transform.rotation.x = float(x)
+        t.transform.rotation.y = float(y)
+        t.transform.rotation.z = float(z)
+        
+        self.static_tf_broadcaster.sendTransform(t)
+    
+    def publish_camera_transform(self, T_world_camera):
+        """Публиковать динамический трансформ камеры с стабилизацией"""
+        # Проверить стабильность
+        if not self.is_transform_stable(T_world_camera):
+            self.get_logger().warn('Unstable camera transform detected, skipping...')
+            return
+        
+        # Добавить в историю для сглаживания
+        self.transform_history.append(T_world_camera.copy())
+        if len(self.transform_history) > self.max_history:
+            self.transform_history.pop(0)
+        
+        # Усреднить трансформации для стабилизации
+        if len(self.transform_history) >= 3:
+            avg_translation = np.mean([T[:3, 3] for T in self.transform_history], axis=0)
+            # Для поворотов используем последнюю трансформацию (усреднение кватернионов сложнее)
+            T_smoothed = T_world_camera.copy()
+            T_smoothed[:3, 3] = avg_translation
+        else:
+            T_smoothed = T_world_camera
+        
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = 'world'
+        t.child_frame_id = 'camera'
+        
+        t.transform.translation.x = float(T_smoothed[0, 3])
+        t.transform.translation.y = float(T_smoothed[1, 3])
+        t.transform.translation.z = float(T_smoothed[2, 3])
+        
+        # Конвертировать в кватернион
+        R_mat = T_smoothed[:3, :3]
+        w, x, y, z = self.rotation_matrix_to_quaternion(R_mat)
+        t.transform.rotation.w = float(w)
+        t.transform.rotation.x = float(x)
+        t.transform.rotation.y = float(y)
+        t.transform.rotation.z = float(z)
+        
+        self.dynamic_tf_broadcaster.sendTransform(t)
+        self.last_camera_transform = T_smoothed.copy()
 
 
 def main(args=None):
