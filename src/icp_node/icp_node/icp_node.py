@@ -72,9 +72,9 @@ class ICPNode(Node):
 
         rx = int((self.robot_position[0] - self.x_min) / self.resolution)
         ry = int((self.robot_position[1] - self.y_min) / self.resolution)
-        
+
         if not (0 <= rx < self.width and 0 <= ry < self.height):
-            self.get_logger().warn(f"Robot position ({rx}, {ry}) is outside map bounds")
+            self.get_logger().warn(f'Robot position ({rx}, {ry}) is outside map bounds')
             return
 
         if len(self.global_map.shape) != 2 or self.global_map.shape[0] == 0:
@@ -82,9 +82,9 @@ class ICPNode(Node):
 
         max_points = min(1000, self.global_map.shape[0])
         step = max(1, self.global_map.shape[0] // max_points)
-        
+
         start_idx = max(0, self.global_map.shape[0] - len(self.prev_pcd) if self.prev_pcd is not None else 0)
-        
+
         for i in range(start_idx, self.global_map.shape[0], max(1, step)):
             x, y = self.global_map[i, 0], self.global_map[i, 1]
             grid_x = int((x - self.x_min) / self.resolution)
@@ -169,7 +169,6 @@ class ICPNode(Node):
         poses_list = list(self.robot_path.poses)
         poses_list.append(pose_stamped)
         self.robot_path.poses = poses_list
-        
 
     def publish_transform(self, header):
         transform = TransformStamped()
@@ -261,7 +260,7 @@ class ICPNode(Node):
         xs = ranges * np.cos(angles)
         ys = ranges * np.sin(angles)
         pcd = np.vstack((xs, ys)).T
-        
+
         pcd_norm = np.linalg.norm(pcd, axis=1)
         pcd = pcd[pcd_norm > 0.1]
 

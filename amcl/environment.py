@@ -181,4 +181,3 @@ class GridMap:
             return self.cells[li][col]
         else:
             return self.cells[key]
-

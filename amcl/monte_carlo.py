@@ -3,12 +3,12 @@ This file provides a Particle class and a MonteCarloLocalization Class
 """
 
 import copy as copy
-from math import pi, cos, sin
 import random
-import numpy as np
+from math import cos, pi, sin
 
+import numpy as np
 from cost_map import CostMap
-from robot import Pose3D, LiDARMeasurement
+from robot import LiDARMeasurement, Pose3D
 
 
 class Particle:
